@@ -14,6 +14,7 @@ use crate::inventory_events::{
     InventoryClickEvent, InventoryCloseEvent, InventoryClickEventData, InventoryCloseEventData,
 };
 use crate::kits::KitRegistry;
+use crate::matches::MatchManager;
 use crate::open_menu::{OpenMenu, OpenMenuRegistry};
 use crate::queue::QueueManager;
 use crate::state::StateRegistry;
@@ -23,6 +24,7 @@ pub struct MenuClickRouter {
     pub queue: Arc<QueueManager>,
     pub state: Arc<StateRegistry>,
     pub open_menus: Arc<OpenMenuRegistry>,
+    pub matches: Arc<MatchManager>,
 }
 
 impl EventHandler<InventoryClickEvent> for MenuClickRouter {
@@ -56,6 +58,7 @@ impl EventHandler<InventoryClickEvent> for MenuClickRouter {
                     &self.kits,
                     &self.queue,
                     &self.state,
+                    &self.matches,
                     &server,
                     &data.player,
                 );

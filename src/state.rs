@@ -1,55 +1,50 @@
-//! The Player State Machine.
+//! Per-player state machine.
 //!
-//! Every connected player is conceptually in exactly one of these states.
-//! Every queue/command/GUI action must validate the caller's current state
-//! before doing anything, which is what stops a player queueing twice,
-//! queueing mid-fight, etc.
+//! Every online player is, at any moment, in exactly one of: the lobby, a
+//! queue (waiting for a match to fill), an active match, or spectating one.
+//! This is the single source of truth other modules gate on — `/gm`,
+//! `/queue`, `/lantern <n>` (kit editing) all check `PlayerState::Lobby`
+//! before letting a player start something new, and `MatchManager` flips
+//! fighters to `InMatch`/back to `Lobby` as matches start and end.
 //!
-//! NOTE on event coverage: an earlier pass assumed `PlayerLeaveEvent` wasn't
-//! implemented yet (tracked against an old issue). That's no longer true —
-//! `pumpkin-plugin-api`'s `events/player/player_leave.rs` wraps it, and
-//! `lib.rs` now clears state on it directly. The periodic reconciliation
-//! task is kept anyway as a safety net (covers crashes/disconnects that
-//! might not cleanly fire the event, and any state left over from before
-//! this fix was made).
+//! Deliberately in-memory only (not persisted to disk): a state like
+//! `InMatch { match_id }` or `Queued { mode }` refers to live, in-process
+//! bookkeeping (an active `RunningMatch`, a live queue pool) that doesn't
+//! survive a server restart anyway, so there is nothing meaningful to
+//! reload — every player just starts back at `Lobby` (via `get_or_init`'s
+//! default) after a restart.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-pub type PlayerUuid = String; // TODO: verify real UUID type exposed by pumpkin-plugin-api (likely uuid::Uuid or a wrapper)
-
-/// A queueable mode. The four original built-ins keep fixed variants (so
-/// `/queue nodebuff` etc. don't depend on kit registry contents existing).
-/// `Kit(name)` is added for `/gm`, where every mode is a runtime-created kit
-/// rather than one of these fixed four — this is intentionally open-ended
-/// since kits are created/deleted at runtime via `/lantern`.
+/// The matchmaking pool a player is queued in. The three fixed 1v1 modes
+/// are placeholders for potential built-in game modes; in practice every
+/// kit created via `/lantern` queues under `QueueMode::Kit(name)` — see
+/// `queue_cmd.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QueueMode {
+    Kit(String),
     NoDebuff1v1,
     Sumo1v1,
     Gapple1v1,
     Teams2v2,
-    Kit(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayerState {
+    /// Idle in the hub, free to queue, browse `/gm`, or edit kits.
     Lobby,
+    /// Waiting in a `QueueManager` pool for a match to fill.
     Queued { mode: QueueMode },
+    /// Actively fighting in a running match.
     InMatch { match_id: u64 },
+    /// Eliminated from (or otherwise watching) a match that's still
+    /// running, without being a live fighter in it.
     Spectating { match_id: u64 },
 }
 
-/// Global, thread-safe registry of player states.
-///
-/// Pumpkin plugins run in an async, multi-threaded host, so this needs to be
-/// safe to touch from command handlers, event handlers, and the scheduled
-/// task concurrently. `std::sync::RwLock` is a placeholder — if the plugin
-/// API's async runtime penalizes blocking locks, swap this for
-/// `tokio::sync::RwLock` (the doc's own snippets use `tokio::sync::Mutex`
-/// elsewhere, so tokio is almost certainly already in the dependency tree).
 pub struct StateRegistry {
-    inner: RwLock<HashMap<PlayerUuid, PlayerState>>,
+    inner: RwLock<HashMap<String, PlayerState>>,
 }
 
 impl StateRegistry {
@@ -59,41 +54,30 @@ impl StateRegistry {
         }
     }
 
-    /// Returns the player's current state, defaulting to (and persisting) `Lobby`
-    /// if this is the first time we've seen them.
+    /// Returns this player's current state, defaulting to (and persisting)
+    /// `Lobby` if they have no entry yet — e.g. a player who just joined.
     pub fn get_or_init(&self, uuid: &str) -> PlayerState {
-        {
-            let map = self.inner.read().unwrap();
-            if let Some(state) = map.get(uuid) {
-                return state.clone();
-            }
+        if let Some(state) = self.inner.read().unwrap().get(uuid) {
+            return state.clone();
         }
         let mut map = self.inner.write().unwrap();
-        map.entry(uuid.to_string())
-            .or_insert(PlayerState::Lobby)
-            .clone()
+        map.entry(uuid.to_string()).or_insert(PlayerState::Lobby).clone()
+    }
+
+    pub fn get(&self, uuid: &str) -> Option<PlayerState> {
+        self.inner.read().unwrap().get(uuid).cloned()
     }
 
     pub fn set(&self, uuid: &str, state: PlayerState) {
-        let mut map = self.inner.write().unwrap();
-        map.insert(uuid.to_string(), state);
+        self.inner.write().unwrap().insert(uuid.to_string(), state);
     }
 
+    /// Drops this player's entry entirely (used on disconnect — there's no
+    /// value in remembering a state for someone who isn't online, and it
+    /// keeps the map from growing unboundedly across a long server
+    /// uptime).
     pub fn remove(&self, uuid: &str) {
-        let mut map = self.inner.write().unwrap();
-        map.remove(uuid);
-    }
-
-    /// Drop any tracked players who are not in `online_uuids`. Call this from
-    /// the periodic task to work around the missing PlayerQuitEvent.
-    pub fn reconcile(&self, online_uuids: &[String]) {
-        let mut map = self.inner.write().unwrap();
-        map.retain(|uuid, _| online_uuids.contains(uuid));
-    }
-
-    /// Convenience check used before letting a player queue.
-    pub fn is_lobby(&self, uuid: &str) -> bool {
-        matches!(self.get_or_init(uuid), PlayerState::Lobby)
+        self.inner.write().unwrap().remove(uuid);
     }
 }
 

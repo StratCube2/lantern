@@ -1,8 +1,15 @@
 //! `/queue <kit>` — queue for a named, admin-created kit.
 //! `/dequeue` — leave whatever queue you're in.
 //!
-//! `/gm` still opens a GUI, but the command path now queues directly by kit
+//! `/gm` still opens a GUI, but the command path queues directly by kit
 //! identifier so players do not have to browse the menu first.
+//!
+//! This is the wiring point where a full queue pool actually turns into a
+//! running fight: once `QueueManager::enqueue` returns `MatchReady`, we hand
+//! the roster + kit straight to `MatchManager::try_start_match`. If no arena
+//! is free, per the architecture doc's "Searching for open arena..."
+//! behavior, the players are put right back in queue and told via action
+//! bar rather than being dropped.
 
 use std::sync::Arc;
 
@@ -14,7 +21,8 @@ use pumpkin_plugin_api::{
     uuid,
 };
 
-use crate::kits::KitRegistry;
+use crate::kits::{Kit, KitRegistry};
+use crate::matches::MatchManager;
 use crate::queue::{EnqueueResult, QueueManager};
 use crate::state::{PlayerState, QueueMode, StateRegistry};
 
@@ -38,6 +46,7 @@ pub struct QueueKitExecutor {
     pub kits: Arc<KitRegistry>,
     pub state: Arc<StateRegistry>,
     pub queue: Arc<QueueManager>,
+    pub matches: Arc<MatchManager>,
 }
 
 impl CommandHandler for QueueKitExecutor {
@@ -67,7 +76,7 @@ impl CommandHandler for QueueKitExecutor {
             return Ok(0);
         };
 
-        queue_player_for_kit(&player, &kit.name, &self.state, &self.queue, &server)
+        queue_player_for_kit(&player, &kit, &self.state, &self.queue, &self.matches, &server)
     }
 }
 
@@ -102,26 +111,19 @@ impl CommandHandler for QueueLeaveExecutor {
     }
 }
 
+/// Entry point used by both `/queue <kit>` and the `/gm` GUI click handler.
 pub fn queue_player_for_kit(
     player: &pumpkin_plugin_api::player::Player,
-    kit_name: &str,
+    kit: &Kit,
     state: &StateRegistry,
     queue: &QueueManager,
+    matches: &Arc<MatchManager>,
     server: &Server,
 ) -> Result<i32, CommandError> {
     let uuid = uuid::to_string(player.get_id());
-    queue_player_for_mode(player, server, &uuid, &QueueMode::Kit(kit_name.to_string()), state, queue)
-}
+    let mode = QueueMode::Kit(kit.name.clone());
 
-fn queue_player_for_mode(
-    player: &pumpkin_plugin_api::player::Player,
-    server: &Server,
-    uuid: &str,
-    mode: &QueueMode,
-    state: &StateRegistry,
-    queue: &QueueManager,
-) -> Result<i32, CommandError> {
-    match state.get_or_init(uuid) {
+    match state.get_or_init(&uuid) {
         PlayerState::Lobby => {}
         PlayerState::Queued { .. } => {
             player.send_system_message(
@@ -143,26 +145,29 @@ fn queue_player_for_mode(
         }
     }
 
-    state.set(uuid, PlayerState::Queued { mode: mode.clone() });
+    state.set(&uuid, PlayerState::Queued { mode: mode.clone() });
 
-    match queue.enqueue(mode.clone(), uuid.to_string()) {
-        EnqueueResult::Waiting => {
-            player.send_system_message(
-                TextComponent::text(&format!("Queued for {}. Searching for an opponent...", mode_label(mode))),
-                false,
-            );
+    let needed = kit.required_players();
+    match queue.enqueue(mode.clone(), uuid, needed) {
+        EnqueueResult::Waiting { .. } => {
+            // Action bar feedback ("Searching for <mode>...") is handled by
+            // the periodic lobby HUD task (see lib.rs), which reads
+            // `PlayerState::Queued` every tick -- a one-shot message here
+            // would just get overwritten immediately.
         }
         EnqueueResult::MatchReady(players) => {
-            for uuid_str in &players {
-                if let Some(parsed) = uuid::parse(uuid_str) {
-                    if let Some(matched_player) = server.get_player_by_uuid(parsed) {
-                        matched_player.send_system_message(
-                            TextComponent::text(&format!(
-                                "Queued for {}. Match found! Arena assignment coming in Phase 4.",
-                                mode_label(mode)
-                            )),
-                            false,
-                        );
+            if !matches.try_start_match(server, kit, &players) {
+                // No arena was free (or someone vanished between queueing
+                // and match start) -- requeue everyone rather than drop
+                // them, and let them know via action bar per the
+                // architecture doc's "Searching for open arena..." spec.
+                for uuid_str in &players {
+                    state.set(uuid_str, PlayerState::Queued { mode: mode.clone() });
+                    let _ = queue.enqueue(mode.clone(), uuid_str.clone(), needed);
+                    if let Some(parsed) = uuid::parse(uuid_str) {
+                        if let Some(p) = server.get_player_by_uuid(parsed) {
+                            p.show_actionbar(TextComponent::text("Searching for open arena..."));
+                        }
                     }
                 }
             }
@@ -172,7 +177,7 @@ fn queue_player_for_mode(
     Ok(1)
 }
 
-fn mode_label(mode: &QueueMode) -> String {
+pub fn mode_label(mode: &QueueMode) -> String {
     match mode {
         QueueMode::Kit(name) => name.clone(),
         QueueMode::NoDebuff1v1 => "nodebuff".to_string(),

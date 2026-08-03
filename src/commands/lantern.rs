@@ -159,11 +159,15 @@ impl CommandHandler for LanternDoneExecutor {
             .map(|item| item.registry_key.clone())
             .unwrap_or_else(|| "minecraft:barrier".to_string());
 
-        self.kits.upsert(Kit {
-            name: kit_name.clone(),
-            icon,
-            items,
-        });
+        // Preserve the kit's settings (multiplayer, fall damage, countdown,
+        // ...) if we're re-editing an existing kit; a brand-new kit starts
+        // from `Kit::new`'s defaults. Only the icon + items change here --
+        // the rest are configured separately via `/lantern kit <name> ...`.
+        let mut kit = self.kits.get(&kit_name).unwrap_or_else(|| Kit::new(&kit_name, &icon));
+        kit.icon = icon;
+        kit.items = items;
+
+        self.kits.upsert(kit);
         self.kits.save(&self.data_folder);
         self.open_menus.clear(&uuid_str);
         clear_build_inventory(&player);
@@ -231,5 +235,202 @@ impl CommandHandler for LanternCancelExecutor {
                 Ok(0)
             }
         }
+    }
+}
+
+// NOTE: `/setlobby`'s executor (`SetLobbyExecutor`) and its command-tree
+// builder now live in `lobby.rs` alongside `LobbyStore`, not here -- see
+// that module's doc comment for the deferred-teleport design (teleport on
+// the player's first chat/move event after joining, rather than
+// immediately on `PlayerJoinEvent`) that its `LobbyStore::set` signature is
+// built around.
+
+fn get_bool_arg(args: &ConsumedArgs, name: &str) -> Option<bool> {
+    match args.get_value(name) {
+        Arg::Bool(b) => Some(b),
+        _ => None,
+    }
+}
+
+fn get_string_arg(args: &ConsumedArgs, name: &str) -> Option<String> {
+    match args.get_value(name) {
+        Arg::Simple(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// `/lantern kit "<name>" multiplayer <true|false>` — toggles whether the
+/// kit queues in an XvX pool (using its `team_size`) instead of a plain 1v1.
+pub struct LanternKitMultiplayerExecutor {
+    pub kits: Arc<KitRegistry>,
+    pub data_folder: String,
+}
+
+impl CommandHandler for LanternKitMultiplayerExecutor {
+    fn handle(&self, sender: CommandSender, _server: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let (Some(name), Some(value)) = (get_string_arg(&args, "name"), get_bool_arg(&args, "value")) else {
+            sender.send_message(TextComponent::text(
+                "Usage: /lantern kit \"<name>\" multiplayer <true|false>",
+            ));
+            return Ok(0);
+        };
+
+        let Some(mut kit) = self.kits.get(&name) else {
+            sender.send_message(TextComponent::text(&format!("No kit named '{name}'.")));
+            return Ok(0);
+        };
+        kit.multiplayer = value;
+        self.kits.upsert(kit);
+        self.kits.save(&self.data_folder);
+
+        sender.send_message(TextComponent::text(&format!(
+            "Kit '{name}' multiplayer set to {value}."
+        )));
+        Ok(1)
+    }
+}
+
+/// `/lantern kit "<name>" falldamage <true|false>` — toggles fall damage
+/// enforcement for matches using this kit. Since there's no gamerule setter
+/// exposed to plugins, this is read by `matches.rs`'s poll loop, which zeros
+/// `entity::fall-distance` every tick while the flag is off (see that
+/// module's doc comment).
+pub struct LanternKitFallDamageExecutor {
+    pub kits: Arc<KitRegistry>,
+    pub data_folder: String,
+}
+
+impl CommandHandler for LanternKitFallDamageExecutor {
+    fn handle(&self, sender: CommandSender, _server: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let (Some(name), Some(value)) = (get_string_arg(&args, "name"), get_bool_arg(&args, "value")) else {
+            sender.send_message(TextComponent::text(
+                "Usage: /lantern kit \"<name>\" falldamage <true|false>",
+            ));
+            return Ok(0);
+        };
+
+        let Some(mut kit) = self.kits.get(&name) else {
+            sender.send_message(TextComponent::text(&format!("No kit named '{name}'.")));
+            return Ok(0);
+        };
+        kit.fall_damage = value;
+        self.kits.upsert(kit);
+        self.kits.save(&self.data_folder);
+
+        sender.send_message(TextComponent::text(&format!(
+            "Kit '{name}' fall damage set to {value}."
+        )));
+        Ok(1)
+    }
+}
+
+/// `/lantern kit "<name>" countdown <true|false>` — toggles the 3-second
+/// pre-fight freeze. When off, fighters are dropped straight into combat
+/// after teleporting (see `matches.rs::try_start_match`).
+pub struct LanternKitCountdownExecutor {
+    pub kits: Arc<KitRegistry>,
+    pub data_folder: String,
+}
+
+impl CommandHandler for LanternKitCountdownExecutor {
+    fn handle(&self, sender: CommandSender, _server: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let (Some(name), Some(value)) = (get_string_arg(&args, "name"), get_bool_arg(&args, "value")) else {
+            sender.send_message(TextComponent::text(
+                "Usage: /lantern kit \"<name>\" countdown <true|false>",
+            ));
+            return Ok(0);
+        };
+
+        let Some(mut kit) = self.kits.get(&name) else {
+            sender.send_message(TextComponent::text(&format!("No kit named '{name}'.")));
+            return Ok(0);
+        };
+        kit.countdown = value;
+        self.kits.upsert(kit);
+        self.kits.save(&self.data_folder);
+
+        sender.send_message(TextComponent::text(&format!(
+            "Kit '{name}' countdown set to {value}."
+        )));
+        Ok(1)
+    }
+}
+
+/// `/lantern "<name>" delete` — removes a kit entirely.
+pub struct LanternKitDeleteExecutor {
+    pub kits: Arc<KitRegistry>,
+    pub data_folder: String,
+}
+
+impl CommandHandler for LanternKitDeleteExecutor {
+    fn handle(&self, sender: CommandSender, _server: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let Some(name) = get_string_arg(&args, "name") else {
+            sender.send_message(TextComponent::text("Usage: /lantern \"<name>\" delete"));
+            return Ok(0);
+        };
+
+        if !self.kits.remove(&name) {
+            sender.send_message(TextComponent::text(&format!("No kit named '{name}'.")));
+            return Ok(0);
+        }
+        self.kits.save(&self.data_folder);
+        sender.send_message(TextComponent::text(&format!("Kit '{name}' deleted.")));
+        Ok(1)
+    }
+}
+
+/// `/lantern "<name>" rename <new_name>` — renames a kit in place.
+pub struct LanternKitRenameExecutor {
+    pub kits: Arc<KitRegistry>,
+    pub data_folder: String,
+}
+
+impl CommandHandler for LanternKitRenameExecutor {
+    fn handle(&self, sender: CommandSender, _server: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let (Some(old_name), Some(new_name)) =
+            (get_string_arg(&args, "name"), get_string_arg(&args, "new_name"))
+        else {
+            sender.send_message(TextComponent::text("Usage: /lantern \"<name>\" rename <new_name>"));
+            return Ok(0);
+        };
+
+        if !self.kits.rename(&old_name, &new_name) {
+            sender.send_message(TextComponent::text(&format!(
+                "Couldn't rename '{old_name}' to '{new_name}' — either it doesn't exist or that name is taken."
+            )));
+            return Ok(0);
+        }
+        self.kits.save(&self.data_folder);
+        sender.send_message(TextComponent::text(&format!("Kit '{old_name}' renamed to '{new_name}'.")));
+        Ok(1)
+    }
+}
+
+/// `/lantern stats reset <player>` — wipes a player's stats. Wraps
+/// `StatsRegistry::reset`, which is keyed by uuid, so an offline player's
+/// name is resolved to a uuid first via `StatsRegistry::get_by_name`
+/// (there's no host-side offline-player-lookup exposed to plugins, so this
+/// only works for players who have at least one stats record already).
+pub struct LanternStatsResetExecutor {
+    pub stats: Arc<crate::stats::StatsRegistry>,
+    pub data_folder: String,
+}
+
+impl CommandHandler for LanternStatsResetExecutor {
+    fn handle(&self, sender: CommandSender, _server: Server, args: ConsumedArgs) -> Result<i32, CommandError> {
+        let Some(name) = get_string_arg(&args, "player") else {
+            sender.send_message(TextComponent::text("Usage: /lantern stats reset <player>"));
+            return Ok(0);
+        };
+
+        let Some((uuid_str, _)) = self.stats.get_by_name(&name) else {
+            sender.send_message(TextComponent::text(&format!("No stats recorded for '{name}' yet.")));
+            return Ok(0);
+        };
+
+        self.stats.reset(&uuid_str);
+        self.stats.save(&self.data_folder);
+        sender.send_message(TextComponent::text(&format!("Stats for '{name}' have been reset.")));
+        Ok(1)
     }
 }

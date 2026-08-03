@@ -1,19 +1,13 @@
-//! `InventoryClickEvent` / `InventoryCloseEvent` wrappers.
-//!
-//! `pumpkin-plugin-api` currently only hand-wraps `block`, `packet`, `player`,
-//! and `server` events (see its `events/mod.rs`) — inventory events aren't
-//! wrapped yet, even though `event.wit` defines `inventory-click-event-data`
-//! and `inventory-close-event-data` and the host dispatches them. Since
-//! `FromIntoEvent` is public API, we wrap these two ourselves, following the
-//! exact pattern used by the crate's own `events/player/player_join.rs`.
-//!
-//! This is what the GUI kit-creator (`/lantern`) and kit-queue menu (`/gm`)
-//! click handling is built on.
+//! Thin `FromIntoEvent` wrappers for the two inventory events Lantern needs
+//! (`InventoryClickEvent`/`InventoryCloseEvent`), following the exact same
+//! pattern the host crate itself uses for e.g. `PlayerLeaveEvent`
+//! (`pumpkin_plugin_api::events::player::player_leave`). These two aren't
+//! pre-wrapped in `pumpkin_plugin_api::events` (only the `player`/`block`/
+//! `server`/`packet` groups are), so `menu_router.rs` needs its own local
+//! wrapper to hook `Context::register_event_handler`.
 
-use pumpkin_plugin_api::events::FromIntoEvent;
-use pumpkin_plugin_api::events_wit::{Event, EventType};
-
-// Re-exported so callers only need `crate::inventory_events::*`.
+use pumpkin_plugin_api::EventType;
+use pumpkin_plugin_api::events::{Event, FromIntoEvent};
 pub use pumpkin_plugin_api::events_wit::{InventoryClickEventData, InventoryCloseEventData};
 
 pub struct InventoryClickEvent;

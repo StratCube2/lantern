@@ -1,14 +1,15 @@
 //! Lobby spawn point: `/setlobby` stores the caller's current position
 //! (world id + x/y/z/yaw/pitch), persisted to `lobby.toml` in the plugin's
 //! data folder. On `PlayerJoinEvent` we mark the player for a deferred lobby
-//! teleport, then actually teleport them after their first chat or movement
-//! event so the server has finished finishing their join.
+//! teleport, then actually teleport them after their first chat event or,
+//! for movement, after a 10-tick delay so the server has finished finishing
+//! their join.
 //!
 //! There is no vanilla "world spawn setter" or "player spawn setter" exposed
 //! to plugins (checked against player.wit / world.wit / server.wit) — so we
 //! own this ourselves rather than trying to touch a bed/anchor-style spawn.
 
-use std::{collections::HashSet, sync::RwLock};
+use std::{collections::HashSet, sync::{Arc, RwLock}};
 
 use pumpkin_plugin_api::events::player::PlayerJoinEvent;
 use pumpkin_plugin_api::events::{EventHandler, EventPriority, FromIntoEvent};
@@ -18,10 +19,13 @@ use pumpkin_plugin_api::{
     Context, Server,
     command::{CommandError, CommandSender, ConsumedArgs},
     commands::CommandHandler,
+    scheduler::SchedulerExt,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::player_events::{PlayerChatEvent, PlayerMoveEvent};
+
+const LOBBY_MOVE_TELEPORT_DELAY_TICKS: u64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LobbyLocation {
@@ -36,6 +40,7 @@ pub struct LobbyLocation {
 pub struct LobbyStore {
     inner: RwLock<Option<LobbyLocation>>,
     pending_teleports: RwLock<HashSet<String>>,
+    scheduled_teleports: RwLock<HashSet<String>>,
 }
 
 impl LobbyStore {
@@ -43,6 +48,7 @@ impl LobbyStore {
         Self {
             inner: RwLock::new(None),
             pending_teleports: RwLock::new(HashSet::new()),
+            scheduled_teleports: RwLock::new(HashSet::new()),
         }
     }
 
@@ -62,18 +68,51 @@ impl LobbyStore {
         self.pending_teleports.write().unwrap().remove(uuid);
     }
 
+    fn mark_scheduled(&self, uuid: &str) -> bool {
+        self.scheduled_teleports.write().unwrap().insert(uuid.to_string())
+    }
+
+    fn clear_scheduled(&self, uuid: &str) {
+        self.scheduled_teleports.write().unwrap().remove(uuid);
+    }
+
     pub fn try_teleport_pending(
         &self,
         player: &pumpkin_plugin_api::player::Player,
         server: &Server,
     ) -> bool {
         let uuid_str = uuid::to_string(player.get_id());
+        self.try_teleport_pending_by_uuid(&uuid_str, server)
+    }
+
+    pub fn schedule_move_teleport(self: &Arc<Self>, player: &pumpkin_plugin_api::player::Player, server: &Server) -> bool {
+        let uuid_str = uuid::to_string(player.get_id());
         if !self.pending_teleports.read().unwrap().contains(&uuid_str) {
             return false;
         }
 
+        if !self.mark_scheduled(&uuid_str) {
+            return false;
+        }
+
+        let this = Arc::clone(self);
+        let uuid_for_task = uuid_str.clone();
+        server.schedule_delayed_task(LOBBY_MOVE_TELEPORT_DELAY_TICKS, move |server| {
+            let _ = this.try_teleport_pending_by_uuid(&uuid_for_task, &server);
+        });
+
+        true
+    }
+
+    fn try_teleport_pending_by_uuid(&self, uuid_str: &str, server: &Server) -> bool {
+        if !self.pending_teleports.read().unwrap().contains(uuid_str) {
+            self.clear_scheduled(uuid_str);
+            return false;
+        }
+
         let Some(loc) = self.get() else {
-            self.clear_pending(&uuid_str);
+            self.clear_scheduled(uuid_str);
+            self.clear_pending(uuid_str);
             return false;
         };
 
@@ -83,11 +122,23 @@ impl LobbyStore {
             .find(|w| w.get_id() == loc.world_id)
         else {
             tracing::warn!("Lobby world '{}' no longer exists.", loc.world_id);
+            self.clear_scheduled(uuid_str);
+            return false;
+        };
+
+        let Some(player_uuid) = uuid::parse(uuid_str) else {
+            self.clear_scheduled(uuid_str);
+            return false;
+        };
+
+        let Some(player) = server.get_player_by_uuid(player_uuid) else {
+            self.clear_scheduled(uuid_str);
             return false;
         };
 
         player.teleport((loc.x, loc.y, loc.z), Some(loc.yaw), Some(loc.pitch), world);
-        self.clear_pending(&uuid_str);
+        self.clear_pending(uuid_str);
+        self.clear_scheduled(uuid_str);
         player.send_system_message(TextComponent::text("Teleported to the lobby."), false);
         true
     }
@@ -206,7 +257,7 @@ impl EventHandler<PlayerMoveEvent> for TeleportPendingOnAction {
         server: Server,
         data: <PlayerMoveEvent as FromIntoEvent>::Data,
     ) -> <PlayerMoveEvent as FromIntoEvent>::Data {
-        let _ = self.store.try_teleport_pending(&data.player, &server);
+        let _ = self.store.schedule_move_teleport(&data.player, &server);
         data
     }
 }

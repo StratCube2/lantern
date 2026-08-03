@@ -1,241 +1,309 @@
+//! Lantern — a PvP practice core plugin for Pumpkin-MC.
+//!
+//! This is the wiring root: constructs every registry/manager, loads their
+//! persisted state, registers permissions + command trees + event handlers,
+//! and schedules the lobby HUD task. The actual feature logic lives in the
+//! other modules (`arena`, `stats`, `tiers`, `matches`, `kits`, `queue`,
+//! `state`, `lobby`, `open_menu`); this file only builds and connects them.
+
+mod arena;
 mod commands;
+mod hud;
 mod inventory_events;
 mod kits;
 mod lobby;
+mod matches;
 mod menu_router;
 mod open_menu;
 mod player_events;
 mod queue;
 mod state;
+mod stats;
+mod tiers;
 
 use std::sync::Arc;
 
-use pumpkin_plugin_api::{
-    Context, Plugin, PluginMetadata,
-    events::EventPriority,
-    permission::{Permission, PermissionDefault, PermissionLevel},
-    permissions,
-    scheduler::SchedulerExt,
-    uuid,
-};
-use tracing::*;
+use pumpkin_plugin_api::events::EventPriority;
+use pumpkin_plugin_api::permission::{Permission, PermissionChild, PermissionDefault, PermissionLevel};
+use pumpkin_plugin_api::scheduler::SchedulerExt;
+use pumpkin_plugin_api::{Context, Plugin, PluginMetadata, register_plugin};
 
+use arena::ArenaRegistry;
+use hud::{LOBBY_HUD_PERIOD_TICKS, tick_lobby_hud};
 use inventory_events::{InventoryClickEvent, InventoryCloseEvent};
 use kits::KitRegistry;
-use lobby::LobbyStore;
+use lobby::{LobbyStore, TeleportPendingOnAction, TeleportToLobbyOnJoin};
+use matches::MatchManager;
 use menu_router::MenuClickRouter;
 use open_menu::OpenMenuRegistry;
-use pumpkin_plugin_api::events::player::PlayerLeaveEvent;
-use pumpkin_plugin_api::events::{EventHandler, FromIntoEvent};
+use player_events::{CleanupOnLeave, PlayerChatEvent, PlayerMoveEvent, SetStateOnJoin};
+use pumpkin_plugin_api::events::player::{PlayerJoinEvent, PlayerLeaveEvent};
 use queue::QueueManager;
-use state::{PlayerState, StateRegistry};
+use state::StateRegistry;
+use stats::StatsRegistry;
+use tiers::TierRegistry;
 
-const PERM_QUEUE: &str = "LanternPractice:command.queue";
-const PERM_DUEL: &str = "LanternPractice:command.duel";
-const PERM_GM: &str = "LanternPractice:command.gm";
-const PERM_LANTERN: &str = "LanternPractice:command.lantern";
-const PERM_SETLOBBY: &str = "LanternPractice:command.setlobby";
+/// The Lantern plugin's permission node namespace. Must exactly match
+/// `PluginMetadata.name` below, or the host rejects the plugin at load.
+const PLUGIN_NAME: &str = "lantern";
 
-struct LanternPracticePlugin {
-    state: Arc<StateRegistry>,
-    queue: Arc<QueueManager>,
-    kits: Arc<KitRegistry>,
-    open_menus: Arc<OpenMenuRegistry>,
-    lobby: Arc<LobbyStore>,
+fn perm_node(suffix: &str) -> String {
+    format!("{PLUGIN_NAME}:{suffix}")
 }
 
-impl Plugin for LanternPracticePlugin {
+pub struct LanternPlugin {
+    kits: Arc<KitRegistry>,
+    arenas: Arc<ArenaRegistry>,
+    stats: Arc<StatsRegistry>,
+    tiers: Arc<TierRegistry>,
+    state: Arc<StateRegistry>,
+    queue: Arc<QueueManager>,
+    lobby: Arc<LobbyStore>,
+    open_menus: Arc<OpenMenuRegistry>,
+    matches: Arc<MatchManager>,
+    data_folder: String,
+}
+
+impl Plugin for LanternPlugin {
     fn new() -> Self {
-        LanternPracticePlugin {
-            state: Arc::new(StateRegistry::new()),
-            queue: Arc::new(QueueManager::new()),
-            kits: Arc::new(KitRegistry::new()),
-            open_menus: Arc::new(OpenMenuRegistry::new()),
-            lobby: Arc::new(LobbyStore::new()),
+        let kits = Arc::new(KitRegistry::new());
+        let arenas = Arc::new(ArenaRegistry::new());
+        let stats = Arc::new(StatsRegistry::new());
+        let tiers = Arc::new(TierRegistry::new());
+        let state = Arc::new(StateRegistry::new());
+        let queue = Arc::new(QueueManager::new());
+        let lobby = Arc::new(LobbyStore::new());
+        let open_menus = Arc::new(OpenMenuRegistry::new());
+        let matches = Arc::new(MatchManager::new(
+            arenas.clone(),
+            stats.clone(),
+            tiers.clone(),
+            state.clone(),
+            lobby.clone(),
+        ));
+
+        Self {
+            kits,
+            arenas,
+            stats,
+            tiers,
+            state,
+            queue,
+            lobby,
+            open_menus,
+            matches,
+            data_folder: String::new(),
         }
     }
 
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
-            name: "LanternPractice".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            authors: vec!["you".into()],
-            description: "1v1/XvX practice duels for Pumpkin.".into(),
+            name: PLUGIN_NAME.to_string(),
+            version: "0.1.0".to_string(),
+            authors: vec!["Joel".to_string()],
+            description: "A practice PvP core: kits, arenas, matchmaking, stats, and tiers."
+                .to_string(),
             dependencies: vec![],
-            // fs.read.data / fs.write.data are required for lobby.toml and
-            // kits.toml persistence in the plugin's data folder (see
-            // permissions.rs doc comments on these two constants).
-            permissions: vec![permissions::FS_READ_DATA.into(), permissions::FS_WRITE_DATA.into()],
+            permissions: vec![
+                pumpkin_plugin_api::permissions::FS_READ_DATA.to_string(),
+                pumpkin_plugin_api::permissions::FS_WRITE_DATA.to_string(),
+            ],
         }
     }
 
     fn on_load(&mut self, context: Context) -> pumpkin_plugin_api::Result<()> {
-        info!("LanternPractice loading...");
+        self.data_folder = context.get_data_folder();
 
-        let data_folder = context.get_data_folder();
+        // --- Load persisted state ---------------------------------------
+        self.kits.load(&self.data_folder);
+        self.arenas.load(&self.data_folder);
+        self.stats.load(&self.data_folder);
+        self.tiers.load(&self.data_folder);
+        self.lobby.load(&self.data_folder);
 
-        // -- Permissions --------------------------------------------------
-        // /queue, /dequeue, /duel, /gm are open to everyone by default; /lantern
-        // and /setlobby default to gamemaster-tier (level 2) since they let
-        // someone reshape the lobby / create kits server-wide.
-        context.register_permission(&Permission {
-            node: PERM_QUEUE.to_string(),
-            description: "Allows queueing for a Practice duel".to_string(),
-            default: PermissionDefault::Allow,
-            children: Vec::new(),
-        })?;
-        context.register_permission(&Permission {
-            node: PERM_DUEL.to_string(),
-            description: "Allows challenging another player directly".to_string(),
-            default: PermissionDefault::Allow,
-            children: Vec::new(),
-        })?;
-        context.register_permission(&Permission {
-            node: PERM_GM.to_string(),
-            description: "Allows opening the kit queue menu".to_string(),
-            default: PermissionDefault::Allow,
-            children: Vec::new(),
-        })?;
-        context.register_permission(&Permission {
-            node: PERM_LANTERN.to_string(),
-            description: "Allows creating/editing kits".to_string(),
-            default: PermissionDefault::Op(PermissionLevel::Two),
-            children: Vec::new(),
-        })?;
-        context.register_permission(&Permission {
-            node: PERM_SETLOBBY.to_string(),
-            description: "Allows setting the lobby spawn point".to_string(),
-            default: PermissionDefault::Op(PermissionLevel::Two),
-            children: Vec::new(),
-        })?;
+        // --- Permissions --------------------------------------------------
+        // Admin-only surfaces (arena editing, tier editing, kit creation)
+        // default to op level three ("admin"); everything read-only
+        // (queueing, browsing kits, checking stats) is open to everyone.
+        register_permission(&context, "arena", "Manage practice arenas.", op_default())?;
+        register_permission(&context, "tier", "Manage tier/level phases.", op_default())?;
+        register_permission(&context, "lantern", "Create and manage kits.", op_default())?;
+        register_permission(&context, "queue", "Queue for a kit.", PermissionDefault::Allow)?;
+        register_permission(&context, "dequeue", "Leave a queue.", PermissionDefault::Allow)?;
+        register_permission(&context, "gm", "Open the kit picker.", PermissionDefault::Allow)?;
+        register_permission(&context, "stats", "View match statistics.", PermissionDefault::Allow)?;
+        register_permission(
+            &context,
+            "leaderboard",
+            "View top players.",
+            PermissionDefault::Allow,
+        )?;
+        register_permission(&context, "done", "Save the kit you're editing.", op_default())?;
+        register_permission(&context, "cancel", "Discard the kit you're editing.", op_default())?;
+        register_permission(&context, "setlobby", "Set the lobby spawn point.", op_default())?;
+        register_permission(&context, "duel", "Challenge a player directly.", PermissionDefault::Allow)?;
 
-        // -- Commands -------------------------------------------------------
+        // --- Command trees --------------------------------------------------
+        let arena_tree = commands::build_arena_tree(self.arenas.clone(), self.data_folder.clone());
+        context.register_command(arena_tree, &perm_node("arena"));
+
+        let tier_tree = commands::build_tier_tree(self.tiers.clone(), self.data_folder.clone());
+        context.register_command(tier_tree, &perm_node("tier"));
+
+        let stats_tree = commands::build_stats_tree(self.stats.clone());
+        context.register_command(stats_tree, &perm_node("stats"));
+
+        let leaderboard_tree = commands::build_leaderboard_tree(self.stats.clone());
+        context.register_command(leaderboard_tree, &perm_node("leaderboard"));
+
         let queue_tree = commands::build_queue_tree(
             self.kits.clone(),
             self.state.clone(),
             self.queue.clone(),
+            self.matches.clone(),
         );
-        context.register_command(queue_tree, PERM_QUEUE);
+        context.register_command(queue_tree, &perm_node("queue"));
 
-        let dequeue_tree = commands::build_dequeue_tree(self.state.clone(), self.queue.clone());
-        context.register_command(dequeue_tree, PERM_QUEUE);
+        let dequeue_cmd = commands::build_dequeue_command(self.state.clone(), self.queue.clone());
+        context.register_command(dequeue_cmd, &perm_node("dequeue"));
 
-        let duel_tree = commands::build_duel_tree();
-        context.register_command(duel_tree, PERM_DUEL);
-
-        let gm_tree = commands::build_gm_tree(
-            self.kits.clone(),
-            self.open_menus.clone(),
-            self.state.clone(),
-        );
-        context.register_command(gm_tree, PERM_GM);
+        let gm_cmd = commands::build_gm_command(self.kits.clone(), self.open_menus.clone(), self.state.clone());
+        context.register_command(gm_cmd, &perm_node("gm"));
 
         let lantern_tree = commands::build_lantern_tree(
             self.kits.clone(),
             self.open_menus.clone(),
             self.state.clone(),
+            self.stats.clone(),
+            self.data_folder.clone(),
         );
-        context.register_command(lantern_tree, PERM_LANTERN);
+        context.register_command(lantern_tree, &perm_node("lantern"));
 
-        let done_tree = commands::build_done_tree(
-            self.kits.clone(),
-            self.open_menus.clone(),
-            data_folder.clone(),
-        );
-        context.register_command(done_tree, PERM_LANTERN);
+        let done_cmd =
+            commands::build_done_command(self.kits.clone(), self.open_menus.clone(), self.data_folder.clone());
+        context.register_command(done_cmd, &perm_node("done"));
 
-        let cancel_tree = commands::build_cancel_tree(self.open_menus.clone());
-        context.register_command(cancel_tree, PERM_LANTERN);
+        let cancel_cmd = commands::build_cancel_command(self.open_menus.clone());
+        context.register_command(cancel_cmd, &perm_node("cancel"));
 
-        let setlobby_tree = commands::build_setlobby_tree(self.lobby.clone(), data_folder.clone());
-        context.register_command(setlobby_tree, PERM_SETLOBBY);
+        let setlobby_cmd =
+            commands::build_setlobby_command(self.lobby.clone(), self.data_folder.clone());
+        context.register_command(setlobby_cmd, &perm_node("setlobby"));
 
-        // -- Persistence: load kits + lobby from disk ------------------------
-        self.kits.load(&data_folder);
-        lobby::register(&context, self.lobby.clone(), data_folder.clone())?;
+        let duel_cmd = commands::build_duel_command();
+        context.register_command(duel_cmd, &perm_node("duel"));
 
-        // -- Events -----------------------------------------------------------
+        // --- Event handlers -------------------------------------------------
+        let menu_router = MenuClickRouter {
+            kits: self.kits.clone(),
+            queue: self.queue.clone(),
+            state: self.state.clone(),
+            open_menus: self.open_menus.clone(),
+            matches: self.matches.clone(),
+        };
         context.register_event_handler::<InventoryClickEvent, _>(
-            MenuClickRouter {
-                kits: self.kits.clone(),
-                queue: self.queue.clone(),
-                state: self.state.clone(),
-                open_menus: self.open_menus.clone(),
-            },
-            EventPriority::Normal,
-            true, // blocking: we set `cancelled = true` ourselves and need that to stick
-        )?;
-        context.register_event_handler::<InventoryCloseEvent, _>(
-            MenuClickRouter {
-                kits: self.kits.clone(),
-                queue: self.queue.clone(),
-                state: self.state.clone(),
-                open_menus: self.open_menus.clone(),
-            },
-            EventPriority::Normal,
-            false,
-        )?;
-        context.register_event_handler::<PlayerLeaveEvent, _>(
-            CleanupOnLeave {
-                state: self.state.clone(),
-                queue: self.queue.clone(),
-                open_menus: self.open_menus.clone(),
-                lobby: self.lobby.clone(),
-            },
+            menu_router,
             EventPriority::Normal,
             false,
         )?;
 
-        // -- Periodic state reconciliation (unchanged from Phase 1-4) --------
-        let state_for_task = self.state.clone();
-        let queue_for_task = self.queue.clone();
-        context.schedule_repeating_task(600, 600, move |server| {
-            let online: Vec<String> = server
-                .get_all_players()
-                .into_iter()
-                .map(|p| uuid::to_string(p.get_id()))
-                .collect();
-            state_for_task.reconcile(&online);
-            let _ = &queue_for_task;
+        let menu_router_close = MenuClickRouter {
+            kits: self.kits.clone(),
+            queue: self.queue.clone(),
+            state: self.state.clone(),
+            open_menus: self.open_menus.clone(),
+            matches: self.matches.clone(),
+        };
+        context.register_event_handler::<InventoryCloseEvent, _>(
+            menu_router_close,
+            EventPriority::Normal,
+            false,
+        )?;
+
+        let cleanup_on_leave = CleanupOnLeave {
+            queue: self.queue.clone(),
+            state: self.state.clone(),
+            matches: self.matches.clone(),
+            open_menus: self.open_menus.clone(),
+            lobby: self.lobby.clone(),
+        };
+        context.register_event_handler::<PlayerLeaveEvent, _>(
+            cleanup_on_leave,
+            EventPriority::Normal,
+            false,
+        )?;
+
+        // Lobby: mark state on join, then defer the actual teleport until
+        // the player's first chat or move event (avoids racing the client's
+        // own loading screen) -- see lobby.rs's module doc.
+        let set_state_on_join = SetStateOnJoin {
+            state: self.state.clone(),
+        };
+        context.register_event_handler::<PlayerJoinEvent, _>(set_state_on_join, EventPriority::Normal, false)?;
+
+        let teleport_on_join = TeleportToLobbyOnJoin {
+            store: self.lobby.clone(),
+        };
+        context.register_event_handler::<PlayerJoinEvent, _>(teleport_on_join, EventPriority::Normal, false)?;
+
+        let teleport_pending_chat = TeleportPendingOnAction {
+            store: self.lobby.clone(),
+        };
+        context.register_event_handler::<PlayerChatEvent, _>(
+            teleport_pending_chat,
+            EventPriority::Normal,
+            false,
+        )?;
+
+        let teleport_pending_move = TeleportPendingOnAction {
+            store: self.lobby.clone(),
+        };
+        context.register_event_handler::<PlayerMoveEvent, _>(
+            teleport_pending_move,
+            EventPriority::Normal,
+            false,
+        )?;
+
+        // --- Lobby HUD --------------------------------------------------
+        let hud_state = self.state.clone();
+        let hud_stats = self.stats.clone();
+        let hud_tiers = self.tiers.clone();
+        context.schedule_repeating_task(LOBBY_HUD_PERIOD_TICKS, LOBBY_HUD_PERIOD_TICKS, move |server| {
+            tick_lobby_hud(&server, &hud_state, &hud_stats, &hud_tiers);
         });
 
-        info!(
-            "LanternPractice loaded. /queue, /dequeue, /duel <player>, /gm, /lantern <name>, /done, /setlobby"
-        );
+        tracing::info!("Lantern loaded.");
         Ok(())
     }
 
     fn on_unload(&mut self, _context: Context) -> pumpkin_plugin_api::Result<()> {
-        info!("LanternPractice unloaded. Goodbye!");
+        self.kits.save(&self.data_folder);
+        self.arenas.save(&self.data_folder);
+        self.stats.save(&self.data_folder);
+        self.tiers.save(&self.data_folder);
+        self.lobby.save(&self.data_folder);
+        tracing::info!("Lantern unloaded.");
         Ok(())
     }
 }
 
-pumpkin_plugin_api::register_plugin!(LanternPracticePlugin);
-
-/// Clears a leaving player's tracked state and, if they were queued, pulls
-/// them out of whatever queue pool they were sitting in so they don't sit
-/// there forever after disconnecting.
-struct CleanupOnLeave {
-    state: Arc<StateRegistry>,
-    queue: Arc<QueueManager>,
-    open_menus: Arc<OpenMenuRegistry>,
-    lobby: Arc<LobbyStore>,
+fn op_default() -> PermissionDefault {
+    PermissionDefault::Op(PermissionLevel::Three)
 }
 
-impl EventHandler<PlayerLeaveEvent> for CleanupOnLeave {
-    fn handle(
-        &self,
-        _server: pumpkin_plugin_api::Server,
-        data: <PlayerLeaveEvent as FromIntoEvent>::Data,
-    ) -> <PlayerLeaveEvent as FromIntoEvent>::Data {
-        let uuid_str = uuid::to_string(data.player.get_id());
-        if let PlayerState::Queued { mode } = self.state.get_or_init(&uuid_str) {
-            self.queue.dequeue(mode, &uuid_str);
-        }
-        self.state.remove(&uuid_str);
-        self.open_menus.clear(&uuid_str);
-        self.lobby.clear_pending(&uuid_str);
-        data
-    }
+fn register_permission(
+    context: &Context,
+    suffix: &str,
+    description: &str,
+    default: PermissionDefault,
+) -> pumpkin_plugin_api::Result<()> {
+    let permission = Permission {
+        node: perm_node(suffix),
+        description: description.to_string(),
+        default,
+        children: Vec::<PermissionChild>::new(),
+    };
+    context.register_permission(&permission).map_err(|e| e.to_string())
 }
+
+register_plugin!(LanternPlugin);

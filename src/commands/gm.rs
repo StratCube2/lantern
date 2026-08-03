@@ -16,6 +16,7 @@ use pumpkin_plugin_api::{
 
 use crate::commands::queue_cmd::queue_player_for_kit;
 use crate::kits::KitRegistry;
+use crate::matches::MatchManager;
 use crate::open_menu::{OpenMenu, OpenMenuRegistry};
 use crate::queue::QueueManager;
 use crate::state::{PlayerState, StateRegistry};
@@ -93,6 +94,7 @@ pub fn queue_for_kit_slot(
     kits: &KitRegistry,
     queue: &QueueManager,
     state: &StateRegistry,
+    matches: &std::sync::Arc<MatchManager>,
     server: &Server,
     player: &pumpkin_plugin_api::player::Player,
 ) -> bool {
@@ -100,5 +102,5 @@ pub fn queue_for_kit_slot(
     let Some(kit) = kit_list.get(slot) else {
         return false;
     };
-    queue_player_for_kit(player, &kit.name, state, queue, server).is_ok()
+    queue_player_for_kit(player, kit, state, queue, matches, server).is_ok()
 }

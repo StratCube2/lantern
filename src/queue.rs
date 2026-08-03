@@ -1,5 +1,12 @@
-//! Matchmaking queue pools. Phase 1 only needs enqueue/dequeue + threshold
-//! checks; arena assignment and match start are Phase 4/5.
+//! Matchmaking queue pools.
+//!
+//! The number of players required to fire a match is no longer hardcoded
+//! per `QueueMode` — the four fixed built-in modes (nodebuff/sumo/gapple are
+//! 1v1, teams is 2v2) still have a sensible default via
+//! `QueueMode::default_required_players()`, but `Kit(_)` modes pull their
+//! real player count from `Kit::required_players()` (see kits.rs), which
+//! respects the `/lantern kit "<name>" multiplayer` + team-size setting.
+//! Callers pass the resolved count into `enqueue` directly.
 
 use crate::state::QueueMode;
 use std::collections::{HashMap, VecDeque};
@@ -10,21 +17,24 @@ pub struct QueueManager {
 }
 
 impl QueueMode {
-    pub fn required_players(&self) -> usize {
+    /// Fallback player count for modes where the caller doesn't have a more
+    /// precise number on hand (e.g. the four fixed built-in modes). `Kit(_)`
+    /// callers should prefer `Kit::required_players()` from the actual kit
+    /// definition and pass that into `QueueManager::enqueue` instead of
+    /// relying on this default.
+    pub fn default_required_players(&self) -> usize {
         match self {
             QueueMode::NoDebuff1v1 | QueueMode::Sumo1v1 | QueueMode::Gapple1v1 => 2,
             QueueMode::Teams2v2 => 4,
-            // Kits created via /lantern are 1v1 by default. If team kits are
-            // wanted later, this needs a per-kit player-count field on `Kit`
-            // (kits.rs) rather than a hardcoded guess here.
             QueueMode::Kit(_) => 2,
         }
     }
 }
 
 pub enum EnqueueResult {
-    /// Not enough players yet; still waiting.
-    Waiting,
+    /// Not enough players yet; still waiting. Carries the current pool size
+    /// and how many are needed, for queue-position/action-bar feedback.
+    Waiting { in_queue: usize, needed: usize },
     /// Enough players were pooled — here are the uuids to pull into a match,
     /// already popped off the queue.
     MatchReady(Vec<String>),
@@ -37,8 +47,11 @@ impl QueueManager {
         }
     }
 
-    pub fn enqueue(&self, mode: QueueMode, uuid: String) -> EnqueueResult {
-        let needed = mode.required_players();
+    /// Enqueues `uuid` under `mode`, firing a match once `needed` players
+    /// have accumulated. `needed` is resolved by the caller (typically
+    /// `Kit::required_players()`) rather than being fixed per-mode, so
+    /// multiplayer/XvX kits work without a special `QueueMode` variant.
+    pub fn enqueue(&self, mode: QueueMode, uuid: String, needed: usize) -> EnqueueResult {
         let mut pools = self.pools.write().unwrap();
         let pool = pools.entry(mode).or_default();
 
@@ -50,7 +63,10 @@ impl QueueManager {
             let drained: Vec<String> = pool.drain(..needed).collect();
             EnqueueResult::MatchReady(drained)
         } else {
-            EnqueueResult::Waiting
+            EnqueueResult::Waiting {
+                in_queue: pool.len(),
+                needed,
+            }
         }
     }
 
