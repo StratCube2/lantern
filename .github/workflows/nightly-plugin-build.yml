@@ -95,6 +95,6 @@ jobs:
           prerelease: true
           draft: false
           files: build_output/plugin-nightly.wasm
-          target_commitish: ${{ steps.check_commits.outputs.upstream_hash }}
+          # REMOVED target_commitish line so it defaults to your plugin repo's current commit
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
