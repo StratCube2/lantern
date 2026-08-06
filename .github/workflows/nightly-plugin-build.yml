@@ -1,60 +1,104 @@
-name: WASM Plugin Nightly Build (tag: build1)
+name: Nightly WASM Plugin Build
 
 on:
-  push:
-    branches:
-      - master
-      - main
-  workflow_dispatch:
+  schedule:
+    # Runs daily at 00:00 UTC to check upstream updates
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allows manual triggers from the Actions tab
+    inputs:
+      force_build:
+        description: 'Bypass commit threshold and force build'
+        type: boolean
+        default: false
 
 env:
-  CARGO_TERM_COLOR: always
-  WASM_TARGET: "wasm32-wasip2"
+  PUMPKIN_REPO: 'Pumpkin-MC/Pumpkin' # Upstream Pumpkin repo
+  COMMIT_THRESHOLD: 5                # Minimum upstream commits required to trigger rebuild
 
 jobs:
-  build-and-release:
-    name: Build WASM Plugin and Release
+  check-and-build:
+    name: Build & Release WASM (wasip2)
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # Granted to create and re-point GitHub Releases
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Plugin Repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Install Rust Stable & WASI p2 Target
+      # ── Check Upstream Commit Delta ───────────────────────────────────────
+      - name: Fetch Upstream Commits & Evaluate Threshold
+        id: check_commits
         run: |
-          rustup update stable && rustup default stable
-          rustup target add ${{ env.WASM_TARGET }}
+          # 1. Fetch latest upstream HEAD commit hash
+          UPSTREAM_HASH=$(git ls-remote https://github.com/${{ env.PUMPKIN_REPO }}.git HEAD | awk '{print $1}')
+          echo "Upstream HEAD: $UPSTREAM_HASH"
+          echo "upstream_hash=$UPSTREAM_HASH" >> $GITHUB_OUTPUT
+
+          # 2. Query GitHub API for last target_commitish stored in the nightly release
+          LAST_BUILT_HASH=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/nightly \
+            | jq -r '.target_commitish // empty')
+
+          if [ -z "$LAST_BUILT_HASH" ] || [ "${{ inputs.force_build }}" == "true" ]; then
+            echo "No prior release found or build forced. Proceeding..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 3. Clone bare history to calculate the commit distance
+          git clone --bare --filter=blob:none https://github.com/${{ env.PUMPKIN_REPO }}.git pumpkin_tmp
+          cd pumpkin_tmp
+          
+          COMMIT_DIFF=$(git rev-list --count ${LAST_BUILT_HASH}..${UPSTREAM_HASH} 2>/dev/null || echo "${{ env.COMMIT_THRESHOLD }}")
+          echo "Commits since last build: $COMMIT_DIFF"
+
+          if [ "$COMMIT_DIFF" -ge "${{ env.COMMIT_THRESHOLD }}" ]; then
+            echo "Threshold met ($COMMIT_DIFF >= ${{ env.COMMIT_THRESHOLD }}). Proceeding with build."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Threshold not met ($COMMIT_DIFF < ${{ env.COMMIT_THRESHOLD }}). Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Toolchain & Target Setup ──────────────────────────────────────────
+      - name: Setup Rust Toolchain (wasm32-wasip2)
+        if: steps.check_commits.outputs.should_build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
 
       - name: Setup Rust Cache
+        if: steps.check_commits.outputs.should_build == 'true'
         uses: Swatinem/rust-cache@v2
 
-      - name: Build WASM Plugin Release
+      # ── Build Plugin Binary ───────────────────────────────────────────────
+      - name: Build Plugin (wasm32-wasip2 release)
+        if: steps.check_commits.outputs.should_build == 'true'
         run: |
-          cargo build --target ${{ env.WASM_TARGET }} --release
-
-      - name: Stage Release Artifacts
-        run: |
+          cargo build --target wasm32-wasip2 --release
+          
           mkdir -p dist
-          # Copies all compiled .wasm binaries from the target release folder
-          cp target/${{ env.WASM_TARGET }}/release/*.wasm dist/
+          # Copy compiled WASM binary/binaries to release folder
+          cp target/wasm32-wasip2/release/*.wasm dist/plugin-nightly.wasm
 
-      - name: Publish / Update Release (tag: build1)
-        uses: softprops/action-gh-release@v3
+      # ── Release to GitHub (Nightly Tag) ───────────────────────────────────
+      - name: Publish / Update Nightly Release
+        if: steps.check_commits.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: build1
-          name: "WASM Plugin Build 1 (${{ github.sha }})"
+          tag_name: nightly
+          name: "Nightly Build (${{ steps.check_commits.outputs.upstream_hash }})"
           body: |
-            Automated WASM Plugin Build (`wasm32-wasip2`).
+            Automated WASP2 Nightly Build for Pumpkin.
             
-            **Commit SHA:** `${{ github.sha }}`
-            **Built at:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            - **Target:** `wasm32-wasip2`
+            - **Pumpkin Commit:** `${{ steps.check_commits.outputs.upstream_hash }}`
+            - **Built at:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
           prerelease: true
           draft: false
-          files: dist/*.wasm
+          files: dist/plugin-nightly.wasm
+          target_commitish: ${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
